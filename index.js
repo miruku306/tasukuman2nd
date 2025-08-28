@@ -269,28 +269,52 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
   res.sendStatus(200);
 });
 
-// ===== 毎分定期チェック =====
+// ===== 定期チェック (毎分) =====
 cron.schedule('* * * * *', async () => {
-  const { data, error } = await supabase
-    .from('todos')
-    .select('id, user_id, task, date, time, status, is_notified')
-    .eq('status', '未完了')
-    .neq('is_notified', true)
-    .order('date', { ascending: true })
-    .order('time', { ascending: true });
+  console.log("⏰ cron started");
 
-  if (error) return console.error('[Cron Error]', error);
+  try {
+    const { data, error } = await supabase.from('todos')
+      .select('id, user_id, task, date, time, status, is_notified')
+      .eq('status', '未完了')
+      .neq('is_notified', true)
+      .order('date', { ascending: true })
+      .order('time', { ascending: true });
 
-  for (const row of data) {
-    if (isOverdue(row)) {
-      await lineClient.pushMessage(row.user_id, [
-        { type: 'text', text: `💣 タスク「${row.task}」の期限を過ぎています！急いで！！` },
-        { type: 'sticker', packageId: '446', stickerId: '1988' }
-      ]);
-      await supabase.from('todos').update({ is_notified: true }).eq('id', row.id);
+    if (error) {
+      console.error("❌ Supabase error:", error);
+      return;
     }
+
+    if (!data || data.length === 0) {
+      console.log("📭 No tasks to notify");
+      return;
+    }
+
+    for (const row of data) {
+      console.log("🔎 Checking task:", row);
+
+      if (isOverdue(row)) {
+        try {
+          await client.pushMessage(row.user_id, {
+            type: 'text',
+            text: `💣 まだ終わってないタスク「${row.task}」を早くやれ！！`
+          });
+          console.log(`📩 Notified user ${row.user_id} about task: ${row.task}`);
+
+          await supabase.from('todos').update({ is_notified: true }).eq('id', row.id);
+        } catch (err) {
+          console.error("❌ pushMessage error:", err);
+        }
+      } else {
+        console.log(`⏭ 期限未到達: ${row.task}`);
+      }
+    }
+  } catch (err) {
+    console.error("❌ Cron job failed:", err);
   }
 });
+
 
 // ── サーバ起動 ──
 app.listen(PORT, () => {
