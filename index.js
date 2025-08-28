@@ -1,25 +1,28 @@
-/// index.js
-
+// index.js
 require('dotenv').config();
 const express           = require('express');
+const bodyParser        = require('body-parser');
 const path              = require('path');
 const { Client, middleware } = require('@line/bot-sdk');
 const { createClient }  = require('@supabase/supabase-js');
 const cron              = require('node-cron');
 const dayjs             = require('dayjs');
 
-const app  = express();
-const PORT = process.env.PORT || 3000;
+const app   = express();
+const PORT  = process.env.PORT || 3000;
 
-// ── 静的ファイル配信 ──
-// public フォルダをプロジェクト直下に置いている想定
+// ── ミドルウェア設定 ──
+// JSON ボディをパース
+app.use(bodyParser.json());
+
+// 静的ファイル配信
 const publicDir = path.join(__dirname, 'public');
 app.use(express.static(publicDir));
 app.get('/', (req, res) => {
   res.sendFile(path.join(publicDir, 'index.html'));
 });
 
-// ── LINE Bot SDK 設定 ──
+// ── LINE Bot SDK 初期化 ──
 const lineConfig = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret:      process.env.CHANNEL_SECRET,
@@ -68,7 +71,6 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
         const deadlineDate = parts[1] || today;
         const deadlineTime = parts[2] || null;
 
-        // ユーザーのメールアドレス取得
         let userEmail = null;
         const { data: uData, error: uErr } = await supabase
           .from('users')
@@ -77,15 +79,13 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           .single();
         if (!uErr && uData) userEmail = uData.email;
 
-        // メールアドレス未登録なら注意
         if (!userEmail) {
           await lineClient.replyMessage(event.replyToken, {
             type: 'text',
-            text: '⚠️ メールアドレスが登録されていません。通知が届かないかもしれません。\n例: メールアドレス sample@example.com'
+            text: '⚠️ メールアドレス未登録です。通知が届かない可能性があります。\n例: メールアドレス sample@example.com'
           });
         }
 
-        // todos テーブルに保存
         const { error: insertErr } = await supabase
           .from('todos')
           .insert({
@@ -98,7 +98,7 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
             email:       userEmail
           });
         if (insertErr) {
-          console.error('insert error:', insertErr);
+          console.error('Supabase insert error:', insertErr);
           throw insertErr;
         }
 
@@ -120,12 +120,12 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           continue;
         }
 
-        const { data: existing, error: selErr } = await supabase
+        const { data: existing, error: selectErr } = await supabase
           .from('users')
           .select('id')
           .eq('line_user_id', userId)
           .single();
-        if (selErr && selErr.code !== 'PGRST116') throw selErr;
+        if (selectErr && selectErr.code !== 'PGRST116') throw selectErr;
 
         if (existing) {
           const { error: updErr } = await supabase
@@ -152,12 +152,13 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
 
       // --- 進捗確認 ---
       if (text === '進捗確認') {
+        let userEmail = null;
         const { data: uData } = await supabase
           .from('users')
           .select('email')
           .eq('line_user_id', userId)
           .single();
-        const userEmail = uData?.email || null;
+        if (uData) userEmail = uData.email;
 
         let query = supabase
           .from('todos')
@@ -185,12 +186,13 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
 
       // --- 締め切り確認 ---
       if (text === '締め切り確認') {
+        let userEmail = null;
         const { data: uData } = await supabase
           .from('users')
           .select('email')
           .eq('line_user_id', userId)
           .single();
-        const userEmail = uData?.email || null;
+        if (uData) userEmail = uData.email;
 
         let query = supabase
           .from('todos')
@@ -214,12 +216,10 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           lines.push(`🔹 ${row.task} - ${d || '未定'} [${row.status}]`);
           if (isOverdue(row) && row.status === '未完了' && !row.is_notified) {
             await lineClient.pushMessage(userId, [
-              { type: 'text', text: `💣 タスク「${row.task}」の締め切りを過ぎています！急いで！！` }
+              { type: 'text', text: `💣 タスク「${row.task}」の締め切りを過ぎています！` },
+              { type: 'sticker', packageId: '446', stickerId: '1988' }
             ]);
-            await supabase
-              .from('todos')
-              .update({ is_notified: true })
-              .eq('id', row.id);
+            await supabase.from('todos').update({ is_notified: true }).eq('id', row.id);
           }
         }
         await lineClient.replyMessage(event.replyToken, { type: 'text', text: lines.join('\n') });
@@ -284,12 +284,10 @@ cron.schedule('* * * * *', async () => {
   for (const row of data) {
     if (isOverdue(row)) {
       await lineClient.pushMessage(row.user_id, [
-        { type: 'text', text: `💣 タスク「${row.task}」の期限を過ぎています！急いで！！` }
+        { type: 'text', text: `💣 タスク「${row.task}」の期限を過ぎています！急いで！！` },
+        { type: 'sticker', packageId: '446', stickerId: '1988' }
       ]);
-      await supabase
-        .from('todos')
-        .update({ is_notified: true })
-        .eq('id', row.id);
+      await supabase.from('todos').update({ is_notified: true }).eq('id', row.id);
     }
   }
 });
