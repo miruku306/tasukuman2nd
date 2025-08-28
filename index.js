@@ -1,12 +1,26 @@
+// index.js
 require('dotenv').config();
 const express = require('express');
 const line = require('@line/bot-sdk');
 const { createClient } = require('@supabase/supabase-js');
 const cron = require('node-cron');
 const dayjs = require('dayjs');
+const utc = require('dayjs/plugin/utc');
+const timezone = require('dayjs/plugin/timezone');
+const customParseFormat = require('dayjs/plugin/customParseFormat');
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
+dayjs.extend(customParseFormat);
+
+const TZ = 'Asia/Tokyo';
+const nowJST = () => dayjs().tz(TZ);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// ヘルスチェック（Render用）
+app.get('/', (_req, res) => res.status(200).send('OK'));
 
 // LINE Bot 設定
 const config = {
@@ -15,7 +29,7 @@ const config = {
 };
 const client = new line.Client(config);
 
-// Supabase クライアント
+// Supabase
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -25,10 +39,15 @@ const supabase = createClient(
 process.on('uncaughtException', err => console.error('[uncaughtException]', err));
 process.on('unhandledRejection', err => console.error('[unhandledRejection]', err));
 
-// 期限切れ判定
+// 期限切れ判定（JSTで厳密比較）
 function isOverdue(row) {
-  if (!row.date || !row.time) return false;
-  return dayjs(`${row.date} ${row.time}`, 'YYYY-MM-DD HH:mm').isBefore(dayjs());
+  if (!row?.date || !row?.time) return false;
+  const t = typeof row.time === 'string' && row.time.length === 5 ? `${row.time}:00` : row.time; // HH:mm → HH:mm:ss
+  const deadline = dayjs.tz(`${row.date} ${t}`, 'YYYY-MM-DD HH:mm:ss', TZ);
+  const now = nowJST();
+  // デバッグしたい時だけ下のコメントを外してください
+  // console.log('⏱ deadline:', deadline.format(), 'now:', now.format());
+  return deadline.isBefore(now);
 }
 
 // ===== LINE Webhook =====
@@ -48,24 +67,28 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
         const timePart = parts[2];
 
         if (!taskText) {
-          await client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ タスク名を指定してください' });
+          await client.replyMessage(event.replyToken, {
+            type: 'text',
+            text: '⚠️ タスク名を指定してください\n例: 追加 宿題 2025-08-30 21:00'
+          });
           continue;
         }
 
-        const today = dayjs().format('YYYY-MM-DD');
+        const today = nowJST().format('YYYY-MM-DD');
         const deadlineDate = datePart || today;
         const deadlineTime = timePart || null;
 
-        // メールアドレス取得
-        const { data: userData } = await supabase
+        // users からメールアドレス取得
+        const { data: userData, error: userErr } = await supabase
           .from('users')
           .select('email')
           .eq('line_user_id', userId)
           .single();
+        if (userErr && userErr.code !== 'PGRST116') throw userErr;
         const userEmail = userData?.email || null;
 
-        // todos に保存
-        await supabase.from('todos').insert({
+        // todos へ保存
+        const { error: insErr } = await supabase.from('todos').insert({
           user_id: userId,
           task: taskText,
           date: deadlineDate,
@@ -74,8 +97,12 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
           is_notified: false,
           email: userEmail
         });
+        if (insErr) throw insErr;
 
-        await client.replyMessage(event.replyToken, { type: 'text', text: `🆕 タスク「${taskText}」を登録しました` });
+        await client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: `🆕 タスク「${taskText}」を登録しました${deadlineTime ? `（締切 ${deadlineDate} ${deadlineTime}）` : ''}`
+        });
         continue;
       }
 
@@ -83,21 +110,27 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
       if (/^メールアドレス\s+/u.test(text)) {
         const email = text.replace(/^メールアドレス\s+/u, '').trim();
         if (!email) {
-          await client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ メールアドレスを入力してください' });
+          await client.replyMessage(event.replyToken, {
+            type: 'text',
+            text: '⚠️ メールアドレスを入力してください\n例: メールアドレス sample@example.com'
+          });
           continue;
         }
 
-        const { data: existingUser } = await supabase
+        const { data: existing, error: selErr } = await supabase
           .from('users')
           .select('id')
           .eq('line_user_id', userId)
           .single();
+        if (selErr && selErr.code !== 'PGRST116') throw selErr;
 
-        if (existingUser) {
-          await supabase.from('users').update({ email }).eq('id', existingUser.id);
+        if (existing) {
+          const { error } = await supabase.from('users').update({ email }).eq('id', existing.id);
+          if (error) throw error;
           await client.replyMessage(event.replyToken, { type: 'text', text: `📧 メールアドレスを更新しました: ${email}` });
         } else {
-          await supabase.from('users').insert({ line_user_id: userId, email });
+          const { error } = await supabase.from('users').insert({ line_user_id: userId, email });
+          if (error) throw error;
           await client.replyMessage(event.replyToken, { type: 'text', text: `📧 メールアドレスを登録しました: ${email}` });
         }
         continue;
@@ -105,17 +138,27 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
 
       // --- 進捗確認 ---
       if (text === '進捗確認') {
-        const { data: userData } = await supabase.from('users').select('email').eq('line_user_id', userId).single();
+        const { data: userData } = await supabase
+          .from('users')
+          .select('email')
+          .eq('line_user_id', userId)
+          .single();
         const userEmail = userData?.email || null;
 
-        let query = supabase.from('todos')
+        let query = supabase
+          .from('todos')
           .select('id, task, date, time, status, is_notified, email')
           .order('date', { ascending: true })
           .order('time', { ascending: true });
-        query = userEmail ? query.or(`user_id.eq.${userId},email.eq.${userEmail}`) : query.eq('user_id', userId);
 
-        const { data } = await query;
-        if (!data.length) {
+        query = userEmail
+          ? query.or(`user_id.eq.${userId},email.eq.${userEmail}`)
+          : query.eq('user_id', userId);
+
+        const { data, error } = await query;
+        if (error) throw error;
+
+        if (!data?.length) {
           await client.replyMessage(event.replyToken, { type: 'text', text: '📭 進捗中のタスクはありません。' });
           continue;
         }
@@ -127,17 +170,27 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
 
       // --- 締め切り確認 ---
       if (text === '締め切り確認') {
-        const { data: userData } = await supabase.from('users').select('email').eq('line_user_id', userId).single();
+        const { data: userData } = await supabase
+          .from('users')
+          .select('email')
+          .eq('line_user_id', userId)
+          .single();
         const userEmail = userData?.email || null;
 
-        let query = supabase.from('todos')
+        let query = supabase
+          .from('todos')
           .select('id, task, date, time, status, is_notified, email')
           .order('date', { ascending: true })
           .order('time', { ascending: true });
-        query = userEmail ? query.or(`user_id.eq.${userId},email.eq.${userEmail}`) : query.eq('user_id', userId);
 
-        const { data } = await query;
-        if (!data.length) {
+        query = userEmail
+          ? query.or(`user_id.eq.${userId},email.eq.${userEmail}`)
+          : query.eq('user_id', userId);
+
+        const { data, error } = await query;
+        if (error) throw error;
+
+        if (!data?.length) {
           await client.replyMessage(event.replyToken, { type: 'text', text: '📭 登録されたタスクはありません。' });
           continue;
         }
@@ -148,13 +201,21 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
       }
 
       // --- デフォルト応答 ---
-      await client.replyMessage(event.replyToken, { type: 'text', text:
-        '📌 コマンド一覧:\n追加 タスク名 [YYYY-MM-DD] [HH:mm]\nメールアドレス 登録\n進捗確認\n締め切り確認\n完了 タスク名'
+      await client.replyMessage(event.replyToken, {
+        type: 'text',
+        text:
+          '📌 コマンド一覧:\n' +
+          '追加 タスク名 [YYYY-MM-DD] [HH:mm]\n' +
+          'メールアドレス your@example.com\n' +
+          '進捗確認\n' +
+          '締め切り確認'
       });
 
     } catch (err) {
       console.error('[Webhook Error]', err);
-      await client.replyMessage(event.replyToken, { type: 'text', text: `❗️ エラーが発生しました: ${err.message}` });
+      try {
+        await client.replyMessage(event.replyToken, { type: 'text', text: `❗️ エラーが発生しました: ${err.message}` });
+      } catch (_) {} // 返信期限切れなどは無視
     }
   }
   res.sendStatus(200);
@@ -162,47 +223,42 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
 
 // ===== 定期チェック (毎分) =====
 cron.schedule('* * * * *', async () => {
-  console.log("⏰ cron started");
+  const now = nowJST().format('YYYY-MM-DD HH:mm:ss');
+  console.log('⏰ cron tick JST:', now);
 
-  try {
-    const { data, error } = await supabase.from('todos')
-      .select('id, user_id, task, date, time, status, is_notified')
-      .eq('status', '未完了')
-      .neq('is_notified', true)
-      .order('date', { ascending: true })
-      .order('time', { ascending: true });
+  const { data, error } = await supabase
+    .from('todos')
+    .select('id, user_id, task, date, time, status, is_notified')
+    .eq('status', '未完了')
+    .neq('is_notified', true)
+    .order('date', { ascending: true })
+    .order('time', { ascending: true });
 
-    if (error) {
-      console.error("❌ Supabase error:", error);
-      return;
-    }
+  if (error) {
+    console.error('❌ Supabase error:', error);
+    return;
+  }
+  if (!data?.length) {
+    // console.log('📭 No pending tasks');
+    return;
+  }
 
-    if (!data || data.length === 0) {
-      console.log("📭 No tasks to notify");
-      return;
-    }
-
-    for (const row of data) {
-      console.log("🔎 Checking task:", row);
-
-      if (isOverdue(row)) {
-        try {
-          await client.pushMessage(row.user_id, {
-            type: 'text',
-            text: `💣 まだ終わってないタスク「${row.task}」を早くやれ！！`
-          });
-          console.log(`📩 Notified user ${row.user_id} about task: ${row.task}`);
-
-          await supabase.from('todos').update({ is_notified: true }).eq('id', row.id);
-        } catch (err) {
-          console.error("❌ pushMessage error:", err);
-        }
-      } else {
-        console.log(`⏭ 期限未到達: ${row.task}`);
+  for (const row of data) {
+    if (isOverdue(row)) {
+      try {
+        await client.pushMessage(row.user_id, {
+          type: 'text',
+          text: `💣 まだ終わってないタスク「${row.task}」を早くやれ！！`
+        });
+        await supabase.from('todos').update({ is_notified: true }).eq('id', row.id);
+        console.log('📩 push sent & flagged:', row.id, row.task);
+      } catch (e) {
+        console.error('❌ pushMessage failed:', e?.statusMessage || e?.message || e);
       }
+    } else {
+      // console.log('⏭ not yet:', row.task, row.date, row.time);
     }
-  } catch (err) {
-    console.error("❌ Cron job failed:", err);
   }
 });
+
 app.listen(PORT, () => console.log(`🚀 Bot Webhook running on port ${PORT}`));
