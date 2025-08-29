@@ -38,7 +38,7 @@ const supabase = createClient(
 // ====== 共通ユーティリティ ======
 function pickRandom(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
 
-// 期限切れ判定（JST）
+// 期限切れ判定（JST 厳密）
 function isOverdue(row) {
   if (!row?.date || !row?.time) return false;
   const t = typeof row.time === 'string' && row.time.length === 5 ? `${row.time}:00` : row.time;
@@ -71,7 +71,7 @@ async function sendStickerBurst(to, count = STICKER_BURST_COUNT) {
   }
 }
 
-// ====== 煽り（期限前リマインド：DB変更なし可変タイミング） ======
+// ====== 煽り（期限前リマインド：DB変更なし／可変タイミング） ======
 const TAUNT_MINUTES = (process.env.TAUNT_MINUTES || '2880,1440,360,120,60,30,10,5,1')
   .split(',')
   .map(n => parseInt(n.trim(), 10))
@@ -195,7 +195,7 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
           continue;
         }
 
-        // 未完了から該当を1件取得（完全一致 / 期限が近い順）
+        // 未完了の中から完全一致を1件（期限近い順）
         const { data: candidates, error: qErr } = await supabase
           .from('todos')
           .select('id, task, date, time')
@@ -206,16 +206,20 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
           .order('time', { ascending: true, nullsFirst: true })
           .limit(1);
         if (qErr) throw qErr;
-        const target = candidates?.[0];
 
+        const target = candidates?.[0];
         if (!target) {
           await client.replyMessage(event.replyToken, { type: 'text', text: `⚠️ 未完了のタスク「${taskName}」が見つかりませんでした` });
           continue;
         }
 
+        const patch = { status: '完了', is_notified: true };
+        // completed_at が存在する環境なら活用
+        patch.completed_at = nowJST().toISOString();
+
         const { error: updErr } = await supabase
           .from('todos')
-          .update({ status: '完了', completed_at: nowJST().toISOString(), is_notified: true })
+          .update(patch)
           .eq('id', target.id);
         if (updErr) throw updErr;
 
