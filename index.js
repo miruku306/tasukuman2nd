@@ -29,7 +29,7 @@ const config = {
 };
 const client = new line.Client(config);
 
-// ===== 追加: スタンプ連打の設定とヘルパー =====
+// ===== スタンプ連打の設定とヘルパー =====
 const STICKER_BURST_COUNT = Number(process.env.STICKER_BURST_COUNT || 10); // 送る総数
 const STICKER_BURST_INTERVAL_MS = Number(process.env.STICKER_BURST_INTERVAL_MS || 500); // 5件ごとの間隔(ms)
 
@@ -77,7 +77,6 @@ function isOverdue(row) {
   const t = typeof row.time === 'string' && row.time.length === 5 ? `${row.time}:00` : row.time; // HH:mm → HH:mm:ss
   const deadline = dayjs.tz(`${row.date} ${t}`, 'YYYY-MM-DD HH:mm:ss', TZ);
   const now = nowJST();
-  // デバッグしたい時だけ下のコメントを外してください
   // console.log('⏱ deadline:', deadline.format(), 'now:', now.format());
   return deadline.isBefore(now);
 }
@@ -168,6 +167,60 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
         continue;
       }
 
+      // --- タスク完了 ---
+      if (/^完了(\s+.+)?$/u.test(text)) {
+        const arg = text.replace(/^完了/u, '').trim();
+        if (!arg) {
+          await client.replyMessage(event.replyToken, {
+            type: 'text',
+            text: '⚠️ 使い方: 完了 <ID または タスク名>\n例: 完了 123, 完了 宿題'
+          });
+          continue;
+        }
+
+        // users からメールアドレス取得
+        const { data: userData } = await supabase
+          .from('users')
+          .select('email')
+          .eq('line_user_id', userId)
+          .single();
+        const userEmail = userData?.email || null;
+
+        // 自分のタスクだけを対象に「未完了 → 完了」へ更新
+        let updater = supabase
+          .from('todos')
+          .update({ status: '完了', is_notified: true })
+          .neq('status', '完了');
+
+        updater = userEmail
+          ? updater.or(`user_id.eq.${userId},email.eq.${userEmail}`)
+          : updater.eq('user_id', userId);
+
+        // 引数が数字ならID、そうでなければタスク名で一致
+        if (/^\d+$/.test(arg)) {
+          updater = updater.eq('id', Number(arg));
+        } else {
+          updater = updater.eq('task', arg);
+        }
+
+        const { data: updated, error } = await updater.select('id, task');
+        if (error) throw error;
+
+        if (!updated?.length) {
+          await client.replyMessage(event.replyToken, {
+            type: 'text',
+            text: '対象のタスクが見つかりませんでした。ID は「進捗確認」で確認できます。'
+          });
+        } else {
+          const list = updated.map(r => `✅ [#${r.id}] ${r.task}`).join('\n');
+          await client.replyMessage(event.replyToken, {
+            type: 'text',
+            text: `完了にしました:\n${list}`
+          });
+        }
+        continue;
+      }
+
       // --- 進捗確認 ---
       if (text === '進捗確認') {
         const { data: userData } = await supabase
@@ -195,7 +248,7 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
           continue;
         }
 
-        const lines = data.map(r => `🔹 ${r.task} - ${r.date || '未定'} ${r.time || ''} [${r.status}]`);
+        const lines = data.map(r => `🔹 [#${r.id}] ${r.task} - ${r.date || '未定'} ${r.time || ''} [${r.status}]`);
         await client.replyMessage(event.replyToken, { type: 'text', text: lines.join('\n') });
         continue;
       }
@@ -227,7 +280,7 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
           continue;
         }
 
-        const lines = data.map(r => `🔹 ${r.task} - ${r.date || '未定'} ${r.time || ''} [${r.status}]`);
+        const lines = data.map(r => `🔹 [#${r.id}] ${r.task} - ${r.date || '未定'} ${r.time || ''} [${r.status}]`);
         await client.replyMessage(event.replyToken, { type: 'text', text: lines.join('\n') });
         continue;
       }
@@ -240,7 +293,8 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
           '追加 タスク名 [YYYY-MM-DD] [HH:mm]\n' +
           'メールアドレス your@example.com\n' +
           '進捗確認\n' +
-          '締め切り確認'
+          '締め切り確認\n' +
+          '完了 <ID|タスク名>'
       });
 
     } catch (err) {
