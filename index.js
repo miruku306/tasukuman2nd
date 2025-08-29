@@ -166,7 +166,7 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
         continue;
       }
 
-      // --- タスク完了（ID不要：タスク名一致を完了へ） ---
+      // --- タスク完了（＝削除：Supabaseから物理削除） ---
       if (/^完了(\s+.+)?$/u.test(text)) {
         const name = text.replace(/^完了/u, '').trim();
         if (!name) {
@@ -186,11 +186,10 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
         if (userErr && userErr.code !== 'PGRST116') throw userErr;
         const userEmail = userData?.email || null;
 
-        // 自分の未完了タスクの中から task 名一致を取得
+        // 自分のタスクの中から task 名一致を取得（ステータスは問わず、全部削除）
         let sel = supabase
           .from('todos')
           .select('id, task')
-          .eq('status', '未完了')
           .eq('task', name);
 
         sel = userEmail
@@ -203,22 +202,22 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
         if (!targets?.length) {
           await client.replyMessage(event.replyToken, {
             type: 'text',
-            text: '対象の未完了タスクが見つかりませんでした。'
+            text: '対象のタスクが見つかりませんでした。'
           });
           continue;
         }
 
         const ids = targets.map(t => t.id);
-        const { error: updErr } = await supabase
+        const { error: delErr } = await supabase
           .from('todos')
-          .update({ status: '完了', is_notified: true })
-          .in('id', ids);
-        if (updErr) throw updErr;
+          .delete()
+          .in('id', ids); // ← Supabase 側のレコードを物理削除
+        if (delErr) throw delErr;
 
         const list = targets.map(r => `✅ ${r.task}`).join('\n');
         await client.replyMessage(event.replyToken, {
           type: 'text',
-          text: `完了にしました:\n${list}`
+          text: `完了（削除）にしました:\n${list}`
         });
         continue;
       }
@@ -280,11 +279,12 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
 
       // --- 進捗確認 ---
       if (text === '進捗確認') {
-        const { data: userData } = await supabase
+        const { data: userData, error: userErr } = await supabase
           .from('users')
           .select('email')
           .eq('line_user_id', userId)
           .single();
+        if (userErr && userErr.code !== 'PGRST116') throw userErr;
         const userEmail = userData?.email || null;
 
         let query = supabase
@@ -312,11 +312,12 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
 
       // --- 締め切り確認 ---
       if (text === '締め切り確認') {
-        const { data: userData } = await supabase
+        const { data: userData, error: userErr } = await supabase
           .from('users')
           .select('email')
           .eq('line_user_id', userId)
           .single();
+        if (userErr && userErr.code !== 'PGRST116') throw userErr;
         const userEmail = userData?.email || null;
 
         let query = supabase
@@ -351,7 +352,7 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
           'メールアドレス your@example.com\n' +
           '進捗確認\n' +
           '締め切り確認\n' +
-          '完了 <タスク名>\n' +
+          '完了 <タスク名>（完了＝削除）\n' +
           '削除 <タスク名>（別名: 消去）'
       });
 
@@ -382,9 +383,7 @@ cron.schedule('* * * * *', async () => {
     console.error('❌ Supabase error:', error);
     return;
   }
-  if (!data?.length) {
-    return;
-  }
+  if (!data?.length) return;
 
   for (const row of data) {
     if (isOverdue(row)) {
