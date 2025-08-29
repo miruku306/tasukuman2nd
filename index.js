@@ -90,51 +90,61 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
 
     try {
       // --- タスク追加 ---
-      if (/^(追加|登録)\s+/u.test(text)) {
-        const parts = text.replace(/^(追加|登録)\s+/u, '').trim().split(/\s+/);
-        const taskText = parts[0];
-        const datePart = parts[1];
-        const timePart = parts[2];
+if (/^(追加|登録)\s+/u.test(text)) {
+  const parts = text.replace(/^(追加|登録)\s+/u, '').trim().split(/\s+/);
+  const taskText = parts[0];
+  const datePart = parts[1];
+  const timePart = parts[2];
 
-        if (!taskText) {
-          await client.replyMessage(event.replyToken, {
-            type: 'text',
-            text: '⚠️ タスク名を指定してください\n例: 追加 宿題 2025-08-30 21:00'
-          });
-          continue;
-        }
+  if (!taskText) {
+    await client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: '⚠️ タスク名を指定してください\n例: 追加 宿題 2025-08-30 21:00'
+    });
+    continue;
+  }
 
-        const today = nowJST().format('YYYY-MM-DD');
-        const deadlineDate = datePart || today;
-        const deadlineTime = timePart || null;
+  const today = nowJST().format('YYYY-MM-DD');
+  const deadlineDate = datePart || today;
+  const deadlineTime = timePart || null;
 
-        // users からメールアドレス取得（行なしはOK）
-        const { data: userData, error: userErr } = await supabase
-          .from('users')
-          .select('email')
-          .eq('line_user_id', userId)
-          .single();
-        if (userErr && userErr.code !== 'PGRST116') throw userErr;
-        const userEmail = userData?.email || null;
+  // users からメールアドレス取得（行なしはOK）
+  const { data: userData, error: userErr } = await supabase
+    .from('users')
+    .select('email')
+    .eq('line_user_id', userId)
+    .single();
+  if (userErr && userErr.code !== 'PGRST116') throw userErr;
+  const userEmail = userData?.email || null;
 
-        // todos へ保存
-        const { error: insErr } = await supabase.from('todos').insert({
-          user_id: userId,
-          task: taskText,
-          date: deadlineDate,
-          time: deadlineTime,
-          status: '未完了',
-          is_notified: false,
-          email: userEmail
-        });
-        if (insErr) throw insErr;
+  // ★ ここでメールアドレス未登録チェック
+  if (!userEmail) {
+    await client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: '⚠️ メールアドレスを登録してください。詳細はコマンド一覧を参照にしてください'
+    });
+    continue;
+  }
 
-        await client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: `🆕 タスク「${taskText}」を登録しました${deadlineTime ? `（締切 ${deadlineDate} ${deadlineTime}）` : ''}`
-        });
-        continue;
-      }
+  // todos へ保存
+  const { error: insErr } = await supabase.from('todos').insert({
+    user_id: userId,
+    task: taskText,
+    date: deadlineDate,
+    time: deadlineTime,
+    status: '未完了',
+    is_notified: false,
+    email: userEmail
+  });
+  if (insErr) throw insErr;
+
+  await client.replyMessage(event.replyToken, {
+    type: 'text',
+    text: `🆕 タスク「${taskText}」を登録しました${deadlineTime ? `（締切 ${deadlineDate} ${deadlineTime}）` : ''}`
+  });
+  continue;
+}
+
 
       // --- メールアドレス登録 ---
       if (/^メールアドレス\s+/u.test(text)) {
@@ -386,25 +396,48 @@ cron.schedule('* * * * *', async () => {
   if (!data?.length) return;
 
   for (const row of data) {
-    if (isOverdue(row)) {
-      try {
-        // テキスト通知
-        await client.pushMessage(row.user_id, {
-          type: 'text',
-          text: `💣 まだ終わってないタスク「${row.task}」を早くやれ！！`
-        });
+  if (isOverdue(row)) {
+    try {
+      let targetUserId = null;
 
-        // スタンプ連打
-        await sendStickerBurst(row.user_id);
+      // users テーブルから line_user_id を探す
+      let query = supabase.from('users').select('line_user_id').limit(1);
 
-        // 重複通知防止フラグ
-        await supabase.from('todos').update({ is_notified: true }).eq('id', row.id);
-        console.log('📩 push sent & flagged (with stickers):', row.id, row.task);
-      } catch (e) {
-        console.error('❌ pushMessage failed:', e?.statusMessage || e?.message || e);
+      if (row.user_id && row.email) {
+        query = query.or(`line_user_id.eq.${row.user_id},email.eq.${row.email}`);
+      } else if (row.user_id) {
+        query = query.eq('line_user_id', row.user_id);
+      } else if (row.email) {
+        query = query.eq('email', row.email);
       }
+
+      const { data: userRec, error: userErr } = await query.single();
+      if (userErr && userErr.code !== 'PGRST116') throw userErr;
+
+      targetUserId = userRec?.line_user_id || null;
+
+      if (!targetUserId) {
+        console.warn(`❌ 通知先が見つからない: task=${row.task}, id=${row.id}`);
+        continue;
+      }
+
+      // LINE通知
+      await client.pushMessage(targetUserId, {
+        type: 'text',
+        text: `💣 まだ終わってないタスク「${row.task}」を早くやれ！！`
+      });
+
+      await sendStickerBurst(targetUserId);
+
+      // フラグ更新
+      await supabase.from('todos').update({ is_notified: true }).eq('id', row.id);
+      console.log('📩 push sent & flagged:', row.id, row.task);
+    } catch (e) {
+      console.error('❌ pushMessage failed:', e?.statusMessage || e?.message || e);
     }
   }
+}
+
 });
 
 app.listen(PORT, () => console.log(`🚀 Bot Webhook running on port ${PORT}`));
