@@ -29,6 +29,38 @@ const config = {
 };
 const client = new line.Client(config);
 
+// ===== 追加: スタンプ連打の設定とヘルパー =====
+const STICKER_BURST_COUNT = Number(process.env.STICKER_BURST_COUNT || 10); // 送る総数
+const STICKER_BURST_INTERVAL_MS = Number(process.env.STICKER_BURST_INTERVAL_MS || 500); // 5件ごとの間隔(ms)
+
+// よく使われる無料スタンプの例
+const STICKER_POOL = [
+  { packageId: '446',   stickerId: '1988'  },
+  { packageId: '446',   stickerId: '1990'  },
+  { packageId: '446',   stickerId: '2003'  },
+  { packageId: '11537', stickerId: '52002734' },
+  { packageId: '11537', stickerId: '52002738' },
+  { packageId: '11538', stickerId: '51626495' },
+  { packageId: '11539', stickerId: '52114110' },
+];
+
+// 5件ずつまとめて push。バースト間にウェイトを入れる
+async function sendStickerBurst(to, count = STICKER_BURST_COUNT, intervalMs = STICKER_BURST_INTERVAL_MS) {
+  if (!count || count <= 0) return;
+  const msgs = Array.from({ length: count }, (_, i) => {
+    const s = STICKER_POOL[i % STICKER_POOL.length];
+    return { type: 'sticker', packageId: String(s.packageId), stickerId: String(s.stickerId) };
+  });
+
+  for (let i = 0; i < msgs.length; i += 5) {
+    const chunk = msgs.slice(i, i + 5);
+    await client.pushMessage(to, chunk); // pushMessage は最大5件の配列を受け取れる
+    if (i + 5 < msgs.length) {
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+  }
+}
+
 // Supabase
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -246,12 +278,18 @@ cron.schedule('* * * * *', async () => {
   for (const row of data) {
     if (isOverdue(row)) {
       try {
+        // テキスト通知
         await client.pushMessage(row.user_id, {
           type: 'text',
           text: `💣 まだ終わってないタスク「${row.task}」を早くやれ！！`
         });
+
+        // スタンプ連打
+        await sendStickerBurst(row.user_id);
+
+        // 重複通知防止フラグ
         await supabase.from('todos').update({ is_notified: true }).eq('id', row.id);
-        console.log('📩 push sent & flagged:', row.id, row.task);
+        console.log('📩 push sent & flagged (with stickers):', row.id, row.task);
       } catch (e) {
         console.error('❌ pushMessage failed:', e?.statusMessage || e?.message || e);
       }
