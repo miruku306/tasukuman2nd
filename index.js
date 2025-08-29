@@ -398,26 +398,18 @@ cron.schedule('* * * * *', async () => {
   for (const row of data) {
   if (isOverdue(row)) {
     try {
-      let targetUserId = null;
+      // usersテーブルから line_user_id を取得
+      const { data: userRec, error: userErr } = await supabase
+        .from('users')
+        .select('line_user_id')
+        .or(`line_user_id.eq.${row.user_id},email.eq.${row.email}`)
+        .maybeSingle();
 
-      // users テーブルから line_user_id を探す
-      let query = supabase.from('users').select('line_user_id').limit(1);
-
-      if (row.user_id && row.email) {
-        query = query.or(`line_user_id.eq.${row.user_id},email.eq.${row.email}`);
-      } else if (row.user_id) {
-        query = query.eq('line_user_id', row.user_id);
-      } else if (row.email) {
-        query = query.eq('email', row.email);
-      }
-
-      const { data: userRec, error: userErr } = await query.single();
-      if (userErr && userErr.code !== 'PGRST116') throw userErr;
-
-      targetUserId = userRec?.line_user_id || null;
+      if (userErr) throw userErr;
+      const targetUserId = userRec?.line_user_id;
 
       if (!targetUserId) {
-        console.warn(`❌ 通知先が見つからない: task=${row.task}, id=${row.id}`);
+        console.warn(`❌ 通知先が見つからない: task=${row.task}, id=${row.id}, user_id=${row.user_id}, email=${row.email}`);
         continue;
       }
 
@@ -431,12 +423,14 @@ cron.schedule('* * * * *', async () => {
 
       // フラグ更新
       await supabase.from('todos').update({ is_notified: true }).eq('id', row.id);
+
       console.log('📩 push sent & flagged:', row.id, row.task);
     } catch (e) {
       console.error('❌ pushMessage failed:', e?.statusMessage || e?.message || e);
     }
   }
 }
+
 
 });
 
