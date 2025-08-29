@@ -398,11 +398,11 @@ cron.schedule('* * * * *', async () => {
   for (const row of data) {
   if (isOverdue(row)) {
     try {
-      // usersテーブルから line_user_id を取得
+      // usersテーブルから line_user_id を探す
       const { data: userRec, error: userErr } = await supabase
         .from('users')
         .select('line_user_id')
-        .or(`line_user_id.eq.${row.user_id},email.eq.${row.email}`)
+        .or(`user_id.eq.${row.user_id},email.eq.${row.user_id},user_id.eq.${row.email},email.eq.${row.email}`)
         .maybeSingle();
 
       if (userErr) throw userErr;
@@ -430,6 +430,7 @@ cron.schedule('* * * * *', async () => {
     }
   }
 }
+
 
 
 });
